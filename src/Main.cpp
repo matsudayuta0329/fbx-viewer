@@ -9,12 +9,16 @@
 #include <winrt/Microsoft.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Microsoft.UI.Xaml.Input.h>
 #include <winrt/Microsoft.UI.Xaml.Media.h>
+#include <winrt/Microsoft.UI.Xaml.Markup.h>
+#include <winrt/Microsoft.UI.Xaml.XamlTypeInfo.h>
+#include <winrt/Windows.UI.Xaml.Interop.h>
 #include <winrt/Microsoft.UI.Windowing.h>
 #include <microsoft.ui.xaml.window.h>
 #include <shobjidl.h>
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <fstream>
 
 using namespace winrt;
 using namespace Microsoft::UI::Xaml;
@@ -25,6 +29,14 @@ using namespace Windows::ApplicationModel::DataTransfer;
 using namespace viewer;
 
 namespace {
+bool smokeTest{};
+int exitStatus{};
+void startupLog(std::wstring const &message) {
+    wchar_t executable[32768]{};
+    GetModuleFileNameW(nullptr, executable, static_cast<DWORD>(std::size(executable)));
+    std::ofstream log(std::filesystem::path(executable).parent_path() / L"startup.log", std::ios::app);
+    log << to_string(message) << '\n';
+}
 TextBlock label(hstring const &value, double size = 14) {
     TextBlock t;
     t.Text(value);
@@ -59,7 +71,10 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
         status.Text(text);
     }
     void fail(hstring const &text) {
+        startupLog(L"Error: " + std::wstring(text));
         report(L"エラー: " + text);
+        if (smokeTest)
+            window.Close();
     }
     template <class F> void guarded(F action) {
         try {
@@ -71,6 +86,7 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
         }
     }
     void initialize() {
+        startupLog(L"Initialize window");
         window.Title(L"FBX Viewer");
         window.AppWindow().Resize({1440, 900});
         root.RequestedTheme(ElementTheme::Dark);
@@ -216,6 +232,11 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
                 render3d.draw(settings, elapsed);
                 renderUV.draw(settings, elapsed);
                 dirty = false;
+                if (smokeTest) {
+                    startupLog(L"Startup smoke test passed: both viewports rendered");
+                    exitStatus = 0;
+                    window.Close();
+                }
             } catch (hresult_error const &e) {
                 timer.Stop();
                 ready = false;
@@ -525,28 +546,62 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
         }
     }
 };
-struct App : ApplicationT<App> {
+struct App : ApplicationT<App, Markup::IXamlMetadataProvider> {
     std::shared_ptr<ViewerWindow> viewer;
+    XamlTypeInfo::XamlControlsXamlMetaDataProvider metadataProvider;
+    Markup::IXamlType GetXamlType(Windows::UI::Xaml::Interop::TypeName const &type) {
+        return metadataProvider.GetXamlType(type);
+    }
+    Markup::IXamlType GetXamlType(hstring const &name) {
+        return metadataProvider.GetXamlType(name);
+    }
+    com_array<Markup::XmlnsDefinition> GetXmlnsDefinitions() {
+        return metadataProvider.GetXmlnsDefinitions();
+    }
     App() {
-        Resources().MergedDictionaries().Append(XamlControlsResources());
+        UnhandledException([](auto const &, UnhandledExceptionEventArgs const &e) {
+            startupLog(L"Unhandled XAML exception: " + std::wstring(e.Message()));
+        });
     }
     void OnLaunched(LaunchActivatedEventArgs const &) {
-        viewer = std::make_shared<ViewerWindow>();
-        viewer->initialize();
+        try {
+            // Resource loading queries Application.Current for XAML metadata. The
+            // composable App must be fully constructed before this can succeed.
+            startupLog(L"Create application resources");
+            Resources().MergedDictionaries().Append(XamlControlsResources());
+            startupLog(L"Application resources ready");
+            startupLog(L"Create viewer controls");
+            viewer = std::make_shared<ViewerWindow>();
+            viewer->initialize();
+            startupLog(L"Window activated");
+        } catch (hresult_error const &e) {
+            startupLog(L"Launch failed: " + std::wstring(e.message()));
+            exitStatus = 1;
+            if (!smokeTest)
+                MessageBoxW(nullptr, e.message().c_str(), L"FBX Viewer — 起動エラー", MB_OK | MB_ICONERROR);
+            Exit();
+        }
     }
 };
 } // namespace
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
     try {
+        smokeTest = std::wstring_view(commandLine) == L"--smoke-test";
+        exitStatus = smokeTest ? 1 : 0;
         init_apartment(apartment_type::single_threaded);
+        startupLog(L"Application::Start");
         Application::Start([](auto &&) { make<App>(); });
-        return 0;
+        return exitStatus;
     } catch (hresult_error const &e) {
-        MessageBoxW(nullptr, e.message().c_str(), L"FBX Viewer", MB_OK | MB_ICONERROR);
+        startupLog(L"Startup failed: " + std::wstring(e.message()));
+        if (!smokeTest)
+            MessageBoxW(nullptr, e.message().c_str(), L"FBX Viewer", MB_OK | MB_ICONERROR);
         return 1;
     } catch (std::exception const &e) {
         auto message = to_hstring(e.what());
-        MessageBoxW(nullptr, message.c_str(), L"FBX Viewer", MB_OK | MB_ICONERROR);
+        startupLog(L"Startup failed: " + std::wstring(message));
+        if (!smokeTest)
+            MessageBoxW(nullptr, message.c_str(), L"FBX Viewer", MB_OK | MB_ICONERROR);
         return 1;
     }
 }
