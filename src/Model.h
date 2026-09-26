@@ -6,9 +6,15 @@
 #include <vector>
 
 namespace viewer {
-struct Vec2 { float x{}, y{}; };
-struct Vec3 { float x{}, y{}, z{}; };
-struct Color { float r{1}, g{1}, b{1}, a{1}; };
+struct Vec2 {
+    float x{}, y{};
+};
+struct Vec3 {
+    float x{}, y{}, z{};
+};
+struct Color {
+    float r{1}, g{1}, b{1}, a{1};
+};
 Vec3 operator+(Vec3 a, Vec3 b);
 Vec3 operator-(Vec3 a, Vec3 b);
 Vec3 operator*(Vec3 a, float s);
@@ -30,8 +36,20 @@ struct Model {
     float radius{1};
     uint32_t uvMask{}, colorMask{};
 };
-enum class Mode { Surface, UVScroll, Attribute };
-enum class Attribute { Normal, Position, UV, Index, Tangent, Bitangent, Color };
+enum class Mode {
+    Surface,
+    UVScroll,
+    Attribute
+};
+enum class Attribute {
+    Normal,
+    Position,
+    UV,
+    Index,
+    Tangent,
+    Bitangent,
+    Color
+};
 struct Settings {
     Mode mode{Mode::Surface};
     Attribute attribute{Attribute::Normal};
@@ -41,7 +59,7 @@ struct Settings {
     Vec2 direction{1, 0};
     Color pointColor{};
 };
-Model loadModel(std::filesystem::path const& path);
-Color vertexColor(Vertex const& v, size_t index, Model const& model, Settings const& settings);
-std::wstring describeVertex(Vertex const& v, size_t index, Model const& model);
-}
+Model loadModel(std::filesystem::path const &path);
+Color vertexColor(Vertex const &v, size_t index, Model const &model, Settings const &settings);
+std::wstring describeVertex(Vertex const &v, size_t index, Model const &model);
+} // namespace viewer

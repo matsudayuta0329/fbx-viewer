@@ -7,13 +7,13 @@
   <PropertyGroup Label="Globals">
     <ProjectGuid>{2A583A16-E892-4E72-B89C-3A90F11D9737}</ProjectGuid>
     <RootNamespace>FbxViewer</RootNamespace>
-    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <TargetPlatformVersion>10.0.26100.0</TargetPlatformVersion>
     <WindowsTargetPlatformMinVersion>10.0.19041.0</WindowsTargetPlatformMinVersion>
     <WindowsPackageType>None</WindowsPackageType>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <AppxPackage>false</AppxPackage>
-    <ApplicationType>Windows Store</ApplicationType>
-    <ApplicationTypeRevision>10.0</ApplicationTypeRevision>
+    <TargetPlatformIdentifier>Windows</TargetPlatformIdentifier>
     <AppContainerApplication>false</AppContainerApplication>
     <CppWinRTOptimized>true</CppWinRTOptimized>
     <CppWinRTGenerateWindowsMetadata>false</CppWinRTGenerateWindowsMetadata>
@@ -29,10 +29,14 @@
     <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup><VcpkgRoot Condition="'$(VcpkgRoot)'==''">$(VCInstallDir)vcpkg\</VcpkgRoot></PropertyGroup>
+  <Import Project="$(VcpkgRoot)scripts\buildsystems\msbuild\vcpkg.props" />
   <PropertyGroup>
     <OutDir>$(ProjectDir)build\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(ProjectDir)build\obj\$(Platform)\$(Configuration)\</IntDir>
     <TargetName>FbxViewer</TargetName>
+    <TargetName Condition="'$(ModelTests)'=='true'">ModelTests</TargetName>
+    <IntDir Condition="'$(ModelTests)'=='true'">$(ProjectDir)build\obj\tests\$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
@@ -40,6 +44,7 @@
       <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
       <PreprocessorDefinitions>NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level4</WarningLevel>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <Link><SubSystem>Windows</SubSystem><AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;windowsapp.lib;ole32.lib;shell32.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
@@ -50,11 +55,15 @@
     <PackageReference Include="Microsoft.Windows.CppWinRT" Version="2.0.250303.1" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="src\Main.cpp" />
+    <ClCompile Include="src\Main.cpp" Condition="'$(ModelTests)'!='true'" />
+    <ClCompile Include="tests\ModelTests.cpp" Condition="'$(ModelTests)'=='true'" />
     <ClCompile Include="src\Model.cpp" />
-    <ClCompile Include="src\Renderer.cpp" />
+    <ClCompile Include="src\Renderer.cpp" Condition="'$(ModelTests)'!='true'" />
     <ClInclude Include="src\Model.h" />
     <ClInclude Include="src\Renderer.h" />
+    <ClInclude Include="src\Shaders.h" />
   </ItemGroup>
+  <ItemDefinitionGroup Condition="'$(ModelTests)'=='true'"><Link><SubSystem>Console</SubSystem></Link></ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Import Project="$(VcpkgRoot)scripts\buildsystems\msbuild\vcpkg.targets" />
 </Project>
