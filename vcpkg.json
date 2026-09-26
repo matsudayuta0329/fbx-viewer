@@ -1,0 +1,5 @@
+{
+  "name": "fbx-viewer",
+  "version-string": "0.1.0",
+  "dependencies": [{ "name": "assimp", "default-features": false }]
+}
