@@ -19,7 +19,11 @@ class Renderer {
     void orbit(float dx, float dy);
     void pan(float dx, float dy);
     void zoom(float delta);
-    void draw(Settings const &settings, float time);
+    void draw(Settings const &settings, float time, std::optional<Vec3> shadingEye = {});
+    Vec3 cameraEye() const {
+        return eye();
+    }
+    Color sampleUvColor(Vec2 uv, Settings const &settings, Vec3 shadingEye);
     std::optional<size_t> pick(float x, float y, Settings const &settings) const;
 
   private:
@@ -27,10 +31,12 @@ class Renderer {
     Vec3 eye() const;
     Model const *model_{};
     bool uv_{};
+    std::optional<Vec2> probe_;
+    Color probeColor_;
     float width_{1}, height_{1}, scale_{1}, yaw_{0.65f}, pitch_{0.3f}, distance_{3.2f}, uvZoom_{1};
     Vec3 target_{};
     Vec2 uvCenter_{0.5f, 0.5f};
-    uint32_t indexCount_{}, lineCount_{};
+    uint32_t indexCount_{};
     winrt::com_ptr<ID3D11Device> device_;
     winrt::com_ptr<ID3D11DeviceContext> context_;
     winrt::com_ptr<IDXGISwapChain1> swap_;
@@ -40,7 +46,7 @@ class Renderer {
     winrt::com_ptr<ID3D11PixelShader> pixelShader_;
     winrt::com_ptr<ID3D11GeometryShader> pointShader_;
     winrt::com_ptr<ID3D11InputLayout> layout_;
-    winrt::com_ptr<ID3D11Buffer> vertices_, indices_, lines_, constants_;
+    winrt::com_ptr<ID3D11Buffer> vertices_, indices_, constants_;
     winrt::com_ptr<ID3D11RasterizerState> raster_;
     winrt::com_ptr<ID3D11DepthStencilState> depthOn_, depthOff_;
     winrt::com_ptr<ID3D11BlendState> blend_;

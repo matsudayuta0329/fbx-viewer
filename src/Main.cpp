@@ -60,7 +60,8 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
     Canvas hoverLayer;
     Border hover;
     TextBlock hoverText;
-    ComboBox mode, uvChannel;
+    std::array<ToggleButton, 3> modeButtons;
+    ComboBox uvChannel;
     Flyout settingsFlyout;
     DispatcherTimer timer;
     bool ready{}, loading{}, closed{}, dirty{true};
@@ -127,33 +128,20 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
         tools.Orientation(Orientation::Horizontal);
         tools.Spacing(10);
         Grid::SetColumn(tools, 1);
-        mode.Items().Append(box_value(L"サーフェス"));
-        mode.Items().Append(box_value(L"UVスクロール"));
-        mode.Items().Append(box_value(L"頂点情報"));
-        mode.SelectedIndex(0);
-        mode.MinWidth(150);
-        mode.SelectionChanged([this](auto const &, auto const &) {
-            auto selected = mode.SelectedIndex();
-            if (closed || selected < 0 || selected > 2)
-                return;
-            hideVertexHover();
-            settings.mode = static_cast<Mode>(selected);
-            refreshSettings();
-            dirty = true;
-        });
-        tools.Children().Append(mode);
+        std::array<hstring, 3> modeNames{L"サーフェス", L"UVスクロール", L"頂点情報"};
+        tools.Spacing(2);
+        for (int i = 0; i < 3; ++i) {
+            auto button = modeButtons[i];
+            button.Content(box_value(modeNames[i]));
+            button.IsChecked(i == 0);
+            button.Click([this, i](auto const &, auto const &) { selectMode(i); });
+            tools.Children().Append(button);
+        }
         Button settingsButton;
-        settingsButton.Content(box_value(L"表示設定"));
+        settingsButton.Content(box_value(L"表示設定 ▾"));
         settingsButton.Flyout(settingsFlyout);
+        settingsButton.Margin({8, 0, 0, 0});
         tools.Children().Append(settingsButton);
-        Button fit;
-        fit.Content(box_value(L"全体を表示"));
-        fit.Click([this](auto const &, auto const &) {
-            render3d.fit();
-            renderUV.fit();
-            dirty = true;
-        });
-        tools.Children().Append(fit);
         toolbar.Children().Append(tools);
         root.Children().Append(toolbar);
         ColumnDefinition l;
@@ -176,29 +164,11 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
         title.VerticalAlignment(VerticalAlignment::Top);
         title.IsHitTestVisible(false);
         views.Children().Append(title);
-        StackPanel uvTools;
-        uvTools.Orientation(Orientation::Horizontal);
-        uvTools.Spacing(10);
-        uvTools.Margin({14, 8, 14, 0});
-        uvTools.VerticalAlignment(VerticalAlignment::Top);
-        Grid::SetColumn(uvTools, 2);
-        uvNotice.VerticalAlignment(VerticalAlignment::Center);
-        uvTools.Children().Append(uvNotice);
-        for (int i = 0; i < 8; ++i)
-            uvChannel.Items().Append(box_value(L"TEXCOORD" + to_hstring(i)));
-        uvChannel.SelectedIndex(0);
-        uvChannel.MinWidth(150);
-        uvChannel.SelectionChanged([this](auto const &, auto const &) {
-            auto selected = uvChannel.SelectedIndex();
-            if (closed || selected < 0 || selected >= 8)
-                return;
-            hideVertexHover();
-            settings.uvChannel = selected;
-            refreshColors();
-            updateUVNotice();
-        });
-        uvTools.Children().Append(uvChannel);
-        views.Children().Append(uvTools);
+        uvNotice.Margin({14, 12, 14, 0});
+        uvNotice.VerticalAlignment(VerticalAlignment::Top);
+        uvNotice.IsHitTestVisible(false);
+        Grid::SetColumn(uvNotice, 2);
+        views.Children().Append(uvNotice);
         empty.HorizontalAlignment(HorizontalAlignment::Center);
         empty.VerticalAlignment(VerticalAlignment::Center);
         empty.IsHitTestVisible(false);
@@ -257,7 +227,7 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
                 float elapsed =
                     std::chrono::duration<float>(std::chrono::steady_clock::now() - started).count();
                 render3d.draw(settings, elapsed);
-                renderUV.draw(settings, elapsed);
+                renderUV.draw(settings, elapsed, render3d.cameraEye());
                 dirty = false;
                 if (hoverTest) {
                     runHoverTest();
@@ -422,6 +392,12 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
                 vertex.uvMask = 1;
             }
             model->uvMask = 1;
+            model->vertices[0].colors[0] = {1, 0, 0, 1};
+            model->vertices[1].colors[0] = {0, 1, 0, 1};
+            model->vertices[2].colors[0] = {0, 0, 1, 1};
+            for (auto &vertex : model->vertices)
+                vertex.colorMask = 1;
+            model->colorMask = 1;
             model->indices = {0, 1, 2};
             model->minimum = {-1, -1, 0};
             model->maximum = {1, 1, 0};
@@ -430,8 +406,29 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
             renderUV.setModel(model.get(), settings);
             empty.Visibility(Visibility::Collapsed);
         } else {
+            if (hoverTestStep == 1) {
+                settings.attribute = Attribute::Color;
+                selectMode(2);
+                refreshColors();
+                auto center = renderUV.sampleUvColor({0.6f, 0.6f}, settings, render3d.cameraEye());
+                if (std::abs(center.r - 1.f / 3) > 0.07f || std::abs(center.g - 1.f / 3) > 0.07f ||
+                    std::abs(center.b - 1.f / 3) > 0.07f)
+                    throw hresult_error(E_FAIL, L"UV triangle interior is not interpolated");
+                auto nearRed = renderUV.sampleUvColor({0.53f, 0.53f}, settings, render3d.cameraEye());
+                if (nearRed.r < 0.65f || nearRed.g > 0.2f || nearRed.b > 0.2f)
+                    throw hresult_error(E_FAIL, L"UV vertex color gradient is incorrect");
+                auto outside = renderUV.sampleUvColor({0.2f, 0.2f}, settings, render3d.cameraEye());
+                if (outside.r > 0.12f || outside.g > 0.12f || outside.b > 0.15f)
+                    throw hresult_error(E_FAIL, L"UV drawing escaped polygon bounds");
+                selectMode(0);
+                auto surface = renderUV.sampleUvColor({0.6f, 0.6f}, settings, render3d.cameraEye());
+                if (surface.r < 0.3f)
+                    throw hresult_error(E_FAIL, L"UV surface interior is empty");
+                startupLog(L"UV fill regression passed: interior RGB interpolation, gradient, bounds and "
+                           L"surface shading");
+            }
             if (hoverTestStep % 10 == 0)
-                mode.SelectedIndex((hoverTestStep / 10) % 3);
+                selectMode((hoverTestStep / 10) % 3);
             if (hoverTestStep % 3 == 0) {
                 hideVertexHover();
                 if (hover.Visibility() != Visibility::Collapsed)
@@ -470,11 +467,36 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
             window.Close();
         }
     }
+    void selectMode(int selected) {
+        if (closed || selected < 0 || selected > 2)
+            return;
+        settings.mode = static_cast<Mode>(selected);
+        for (int i = 0; i < 3; ++i)
+            modeButtons[i].IsChecked(i == selected);
+        hideVertexHover();
+        refreshSettings();
+        dirty = true;
+    }
     void refreshSettings() {
         StackPanel content;
         content.Spacing(10);
         content.Width(300);
         content.Children().Append(label(L"表示設定", 20));
+        uvChannel = ComboBox();
+        uvChannel.Header(box_value(L"UVマップ（2D表示 / スクロール）"));
+        for (int i = 0; i < 8; ++i)
+            uvChannel.Items().Append(box_value(L"TEXCOORD" + to_hstring(i)));
+        uvChannel.SelectedIndex(settings.uvChannel);
+        uvChannel.SelectionChanged([this](auto const &sender, auto const &) {
+            auto selected = sender.template as<ComboBox>().SelectedIndex();
+            if (closed || selected < 0 || selected >= 8)
+                return;
+            settings.uvChannel = selected;
+            hideVertexHover();
+            refreshColors();
+            updateUVNotice();
+        });
+        content.Children().Append(uvChannel);
         auto check = [&](hstring const &name, bool value, std::function<void(bool)> change) {
             CheckBox c;
             c.Content(box_value(name));
@@ -539,31 +561,32 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
             ComboBox attribute;
             attribute.Header(box_value(L"頂点情報"));
             attribute.HorizontalAlignment(HorizontalAlignment::Stretch);
-            for (auto name : {L"Normal → RGB", L"Position → RGB", L"TEXCOORD", L"頂点 Index",
-                              L"Tangent → RGB", L"Bitangent → RGB", L"COLOR"})
+            std::vector<std::pair<Attribute, int>> choices;
+            auto addAttribute = [&](hstring const &name, Attribute value, int channel = 0) {
+                choices.emplace_back(value, channel);
                 attribute.Items().Append(box_value(name));
-            attribute.SelectedIndex(static_cast<int>(settings.attribute));
-            attribute.SelectionChanged([this](auto const &sender, auto const &) {
+                if (settings.attribute == value && (value != Attribute::UV && value != Attribute::Color ||
+                                                    settings.attributeChannel == channel))
+                    attribute.SelectedIndex(static_cast<int>(choices.size()) - 1);
+            };
+            addAttribute(L"Normal", Attribute::Normal);
+            addAttribute(L"Position", Attribute::Position);
+            addAttribute(L"頂点 Index", Attribute::Index);
+            addAttribute(L"Tangent", Attribute::Tangent);
+            addAttribute(L"Bitangent", Attribute::Bitangent);
+            for (int i = 0; i < 8; ++i)
+                addAttribute(L"TEXCOORD" + to_hstring(i), Attribute::UV, i);
+            for (int i = 0; i < 8; ++i)
+                addAttribute(L"COLOR" + to_hstring(i), Attribute::Color, i);
+            attribute.SelectionChanged([this, choices](auto const &sender, auto const &) {
                 auto selected = sender.template as<ComboBox>().SelectedIndex();
-                if (closed || selected < 0 || selected > 6)
+                if (closed || selected < 0 || static_cast<size_t>(selected) >= choices.size())
                     return;
-                settings.attribute = static_cast<Attribute>(selected);
+                settings.attribute = choices[selected].first;
+                settings.attributeChannel = choices[selected].second;
                 refreshColors();
             });
             content.Children().Append(attribute);
-            ComboBox channel;
-            channel.Header(box_value(L"TEXCOORD / COLOR 番号"));
-            for (int i = 0; i < 8; ++i)
-                channel.Items().Append(box_value(to_hstring(i)));
-            channel.SelectedIndex(settings.attributeChannel);
-            channel.SelectionChanged([this](auto const &sender, auto const &) {
-                auto selected = sender.template as<ComboBox>().SelectedIndex();
-                if (closed || selected < 0 || selected >= 8)
-                    return;
-                settings.attributeChannel = selected;
-                refreshColors();
-            });
-            content.Children().Append(channel);
             check(L"無彩色の明るさで表示", settings.grayscale, [this](bool v) {
                 settings.grayscale = v;
                 refreshColors();
@@ -574,6 +597,15 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
             content.Children().Append(note);
         }
         ScrollViewer scroll;
+        Button fit;
+        fit.Content(box_value(L"全体を表示"));
+        fit.Click([this](auto const &, auto const &) {
+            render3d.fit();
+            renderUV.fit();
+            hideVertexHover();
+            dirty = true;
+        });
+        content.Children().Append(fit);
         scroll.MaxHeight(650);
         scroll.Content(content);
         settingsFlyout.Content(scroll);
@@ -657,7 +689,9 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
             if (model->uvMask && !(model->uvMask & (1u << settings.uvChannel)))
                 for (int i = 0; i < 8; ++i)
                     if (model->uvMask & (1u << i)) {
-                        uvChannel.SelectedIndex(i);
+                        settings.uvChannel = i;
+                        refreshColors();
+                        refreshSettings();
                         break;
                     }
             empty.Visibility(Visibility::Collapsed);

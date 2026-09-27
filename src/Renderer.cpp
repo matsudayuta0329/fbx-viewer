@@ -151,20 +151,12 @@ void Renderer::resize(float width, float height, float scale) {
 void Renderer::setModel(Model const *model, Settings const &settings) {
     if (!model) {
         model_ = nullptr;
-        indexCount_ = lineCount_ = 0;
+        indexCount_ = 0;
         vertices_ = nullptr;
         indices_ = nullptr;
-        lines_ = nullptr;
         return;
     }
     auto indices = buffer(device_.get(), model->indices, D3D11_BIND_INDEX_BUFFER);
-    std::vector<uint32_t> edges;
-    edges.reserve(model->indices.size() * 2);
-    for (size_t i = 0; i < model->indices.size(); i += 3) {
-        auto a = model->indices[i], b = model->indices[i + 1], c = model->indices[i + 2];
-        edges.insert(edges.end(), {a, b, b, c, c, a});
-    }
-    auto lines = buffer(device_.get(), edges, D3D11_BIND_INDEX_BUFFER);
     std::vector<GPUVertex> data;
     data.reserve(model->vertices.size());
     for (size_t i = 0; i < model->vertices.size(); ++i) {
@@ -175,10 +167,8 @@ void Renderer::setModel(Model const *model, Settings const &settings) {
     auto vertices = buffer(device_.get(), data, D3D11_BIND_VERTEX_BUFFER);
     model_ = model;
     indices_ = std::move(indices);
-    lines_ = std::move(lines);
     vertices_ = std::move(vertices);
     indexCount_ = static_cast<uint32_t>(model->indices.size());
-    lineCount_ = static_cast<uint32_t>(edges.size());
     fit();
 }
 void Renderer::updateColors(Settings const &settings) {
@@ -247,7 +237,7 @@ void Renderer::zoom(float delta) {
     else
         distance_ = std::clamp(distance_ * std::exp(-delta * 0.001f), 0.02f, 1000.f);
 }
-void Renderer::draw(Settings const &s, float time) {
+void Renderer::draw(Settings const &s, float time, std::optional<Vec3> shadingEye) {
     if (!targetView_)
         return;
     float background[] = {0.075f, 0.085f, 0.105f, 1};
@@ -262,12 +252,12 @@ void Renderer::draw(Settings const &s, float time) {
         Constants cb{};
         XMStoreFloat4x4(&cb.transform, matrix());
         auto c = model_->center;
-        auto e = eye();
+        auto e = shadingEye.value_or(eye());
         cb.centerRadius = {c.x, c.y, c.z, model_->radius};
         cb.eyeMode = {e.x, e.y, e.z, static_cast<float>(s.mode)};
         cb.viewport = {width_ * scale_, height_ * scale_, uv_ ? 1.f : 0.f, 0};
         cb.scroll = {s.direction.x * s.speed, s.direction.y * s.speed, time, s.grid};
-        bool transparent = !uv_ && s.mode == Mode::Surface && s.transparent;
+        bool transparent = s.mode == Mode::Surface && s.transparent;
         cb.options = {transparent ? 0.35f : 1.f, 0, s.pointSize * scale_, 0};
         cb.pointColor = {s.pointColor.r, s.pointColor.g, s.pointColor.b, 1};
         auto constant = constants_.get();
@@ -284,16 +274,13 @@ void Renderer::draw(Settings const &s, float time) {
         context_->OMSetBlendState(blend_.get(), nullptr, UINT_MAX);
         context_->OMSetDepthStencilState(transparent || uv_ ? depthOff_.get() : depthOn_.get(), 0);
         context_->UpdateSubresource(constants_.get(), 0, nullptr, &cb, 0, 0);
-        // UV surface shows edges; attribute and scroll modes show their vertex colors.
-        if (!uv_ || s.mode == Mode::Surface) {
-            context_->IASetPrimitiveTopology(uv_ ? D3D11_PRIMITIVE_TOPOLOGY_LINELIST
-                                                 : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            context_->IASetIndexBuffer(uv_ ? lines_.get() : indices_.get(), DXGI_FORMAT_R32_UINT, 0);
-            context_->DrawIndexed(uv_ ? lineCount_ : indexCount_, 0, 0);
-        }
-        if (s.showVertices || (uv_ && s.mode != Mode::Surface)) {
+        // Rasterize the same triangles and interpolants in either world or UV space.
+        context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context_->IASetIndexBuffer(indices_.get(), DXGI_FORMAT_R32_UINT, 0);
+        context_->DrawIndexed(indexCount_, 0, 0);
+        if (s.showVertices) {
             cb.options.x = 1;
-            cb.options.w = (uv_ && s.mode != Mode::Surface) ? 1.f : 2.f;
+            cb.options.w = 2.f;
             context_->UpdateSubresource(constants_.get(), 0, nullptr, &cb, 0, 0);
             context_->GSSetShader(pointShader_.get(), nullptr, 0);
             context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
@@ -301,7 +288,45 @@ void Renderer::draw(Settings const &s, float time) {
             context_->GSSetShader(nullptr, nullptr, 0);
         }
     }
+    if (probe_) {
+        auto clip = XMVector4Transform(XMVectorSet(probe_->x, probe_->y, 0, 1), matrix());
+        XMFLOAT3 point;
+        XMStoreFloat3(&point, clip / XMVectorGetW(clip));
+        auto x = static_cast<UINT>(std::clamp((point.x + 1) * width_ * scale_ / 2, 0.f, width_ * scale_ - 1));
+        auto y =
+            static_cast<UINT>(std::clamp((1 - point.y) * height_ * scale_ / 2, 0.f, height_ * scale_ - 1));
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = desc.Height = desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        winrt::com_ptr<ID3D11Texture2D> pixel;
+        check_hresult(device_->CreateTexture2D(&desc, nullptr, pixel.put()));
+        winrt::com_ptr<ID3D11Resource> source;
+        targetView_->GetResource(source.put());
+        context_->OMSetRenderTargets(0, nullptr, nullptr);
+        D3D11_BOX box{x, y, 0, x + 1, y + 1, 1};
+        context_->CopySubresourceRegion(pixel.get(), 0, 0, 0, 0, source.get(), 0, &box);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        check_hresult(context_->Map(pixel.get(), 0, D3D11_MAP_READ, 0, &mapped));
+        auto bytes = static_cast<uint8_t const *>(mapped.pData);
+        probeColor_ = {bytes[2] / 255.f, bytes[1] / 255.f, bytes[0] / 255.f, bytes[3] / 255.f};
+        context_->Unmap(pixel.get(), 0);
+    }
     check_hresult(swap_->Present(1, 0));
+}
+Color Renderer::sampleUvColor(Vec2 uv, Settings const &settings, Vec3 shadingEye) {
+    if (!uv_)
+        throw std::logic_error("UV probe requires a UV renderer");
+    probe_ = uv;
+    try {
+        draw(settings, 0, shadingEye);
+    } catch (...) {
+        probe_.reset();
+        throw;
+    }
+    probe_.reset();
+    return probeColor_;
 }
 std::optional<size_t> Renderer::pick(float x, float y, Settings const &s) const {
     if (!model_)

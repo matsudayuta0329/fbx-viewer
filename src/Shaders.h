@@ -34,7 +34,6 @@ float4 PS(Output v):SV_TARGET {
         float light=0.42+0.24*abs(dot(n,normalize(float3(0.4,0.8,0.6))));
         float fresnel=pow(1-abs(dot(n,normalize(eyeMode.xyz-v.world))),3);
         color=(light+0.22*fresnel).xxx;
-        if(viewport.z>0.5) color=float3(0.72,0.75,0.8);
     } else if(eyeMode.w<1.5) {
         if(v.hasUV<0.5) color=float3(1,0,1);
         else {
