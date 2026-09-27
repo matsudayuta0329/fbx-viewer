@@ -19,6 +19,7 @@
 #include <functional>
 #include <memory>
 #include <fstream>
+#include <algorithm>
 
 using namespace winrt;
 using namespace Microsoft::UI::Xaml;
@@ -30,6 +31,7 @@ using namespace viewer;
 
 namespace {
 bool smokeTest{};
+bool hoverTest{};
 int exitStatus{};
 void startupLog(std::wstring const &message) {
     wchar_t executable[32768]{};
@@ -55,12 +57,15 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
     std::shared_ptr<Model> model;
     TextBlock status = label(L"FBXファイルを開くか、このウィンドウへドロップしてください。"),
               empty = label(L"FBX VIEWER", 28), uvNotice = label(L"UV / TEXCOORD0", 12);
-    ToolTip hover;
+    Canvas hoverLayer;
+    Border hover;
+    TextBlock hoverText;
     ComboBox mode, uvChannel;
     Flyout settingsFlyout;
     DispatcherTimer timer;
     bool ready{}, loading{}, closed{}, dirty{true};
     uint64_t loadGeneration{};
+    unsigned hoverTestStep{};
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now(), lastHover{};
     struct Drag {
         bool active{}, pan{};
@@ -73,7 +78,7 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
     void fail(hstring const &text) {
         startupLog(L"Error: " + std::wstring(text));
         report(L"エラー: " + text);
-        if (smokeTest)
+        if (smokeTest || hoverTest)
             window.Close();
     }
     template <class F> void guarded(F action) {
@@ -128,7 +133,11 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
         mode.SelectedIndex(0);
         mode.MinWidth(150);
         mode.SelectionChanged([this](auto const &, auto const &) {
-            settings.mode = static_cast<Mode>(mode.SelectedIndex());
+            auto selected = mode.SelectedIndex();
+            if (closed || selected < 0 || selected > 2)
+                return;
+            hideVertexHover();
+            settings.mode = static_cast<Mode>(selected);
             refreshSettings();
             dirty = true;
         });
@@ -180,7 +189,11 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
         uvChannel.SelectedIndex(0);
         uvChannel.MinWidth(150);
         uvChannel.SelectionChanged([this](auto const &, auto const &) {
-            settings.uvChannel = uvChannel.SelectedIndex();
+            auto selected = uvChannel.SelectedIndex();
+            if (closed || selected < 0 || selected >= 8)
+                return;
+            hideVertexHover();
+            settings.uvChannel = selected;
             refreshColors();
             updateUVNotice();
         });
@@ -191,6 +204,22 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
         empty.IsHitTestVisible(false);
         Grid::SetColumnSpan(empty, 3);
         views.Children().Append(empty);
+        // Keep vertex information in the same visual tree as the viewports.
+        // A manually opened, unattached ToolTip has no reliable XamlRoot/owner.
+        hoverLayer.IsHitTestVisible(false);
+        Grid::SetColumnSpan(hoverLayer, 3);
+        hover.Background(brush(30, 36, 46));
+        hover.BorderBrush(brush(75, 85, 100));
+        hover.BorderThickness({1, 1, 1, 1});
+        hover.CornerRadius({6, 6, 6, 6});
+        hover.Padding({10, 10, 10, 10});
+        hoverText.FontSize(12);
+        hoverText.TextWrapping(TextWrapping::Wrap);
+        hoverText.Foreground(brush(235, 239, 245));
+        hover.Child(hoverText);
+        hideVertexHover();
+        hoverLayer.Children().Append(hover);
+        views.Children().Append(hoverLayer);
         status.Margin({14, 8, 14, 8});
         status.FontSize(12);
         status.TextWrapping(TextWrapping::Wrap);
@@ -220,8 +249,6 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
         right.CompositionScaleChanged([this](auto const &, auto const &) { guarded([&] { resize(); }); });
         bindPointer(left, render3d, drag3d);
         bindPointer(right, renderUV, dragUV);
-        hover.Placement(PlacementMode::Mouse);
-        hover.IsHitTestVisible(false);
         timer.Interval(std::chrono::milliseconds(16));
         timer.Tick([this](auto const &, auto const &) {
             if (!ready || closed || (!dirty && settings.mode != Mode::UVScroll))
@@ -232,6 +259,9 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
                 render3d.draw(settings, elapsed);
                 renderUV.draw(settings, elapsed);
                 dirty = false;
+                if (hoverTest) {
+                    runHoverTest();
+                }
                 if (smokeTest) {
                     startupLog(L"Startup smoke test passed: both viewports rendered");
                     exitStatus = 0;
@@ -247,7 +277,7 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
             closed = true;
             ++loadGeneration;
             timer.Stop();
-            hover.IsOpen(false);
+            hideVertexHover();
         });
         refreshSettings();
         window.Content(root);
@@ -257,6 +287,7 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
         return 1;
     }
     void resize() {
+        hideVertexHover();
         if (!ready)
             return;
         render3d.resize(static_cast<float>(left.ActualWidth()), static_cast<float>(left.ActualHeight()),
@@ -299,44 +330,46 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
                     return;
                 drag = {true, props.IsRightButtonPressed() || props.IsMiddleButtonPressed(), p.Position()};
                 panel.CapturePointer(e.Pointer());
-                hover.IsOpen(false);
+                hideVertexHover();
                 e.Handled(true);
             });
         panel.PointerMoved(
             [this, &renderer, &drag, panel](auto const &, Input::PointerRoutedEventArgs const &e) {
-                auto p = e.GetCurrentPoint(panel).Position();
-                if (drag.active) {
-                    float dx = p.X - drag.last.X, dy = p.Y - drag.last.Y;
-                    if (drag.pan)
-                        renderer.pan(dx, dy);
-                    else
-                        renderer.orbit(dx, dy);
-                    drag.last = p;
-                    dirty = true;
+                if (closed || !ready)
                     return;
-                }
-                auto now = std::chrono::steady_clock::now();
-                if (now - lastHover < std::chrono::milliseconds(70))
-                    return;
-                lastHover = now;
-                auto hit = renderer.pick(p.X, p.Y, settings);
-                if (hit && model) {
-                    hover.Content(box_value(describeVertex(model->vertices[*hit], *hit, *model)));
-                    hover.PlacementTarget(panel);
-                    hover.IsOpen(true);
-                } else
-                    hover.IsOpen(false);
+                guarded([&] {
+                    auto p = e.GetCurrentPoint(panel).Position();
+                    if (drag.active) {
+                        float dx = p.X - drag.last.X, dy = p.Y - drag.last.Y;
+                        if (drag.pan)
+                            renderer.pan(dx, dy);
+                        else
+                            renderer.orbit(dx, dy);
+                        drag.last = p;
+                        dirty = true;
+                        return;
+                    }
+                    auto now = std::chrono::steady_clock::now();
+                    if (now - lastHover < std::chrono::milliseconds(70))
+                        return;
+                    lastHover = now;
+                    auto hit = renderer.pick(p.X, p.Y, settings);
+                    if (hit && model) {
+                        showVertexHover(panel, p, *hit);
+                    } else
+                        hideVertexHover();
+                });
             });
         panel.PointerReleased([&drag, panel](auto const &, Input::PointerRoutedEventArgs const &) {
             drag.active = false;
             panel.ReleasePointerCaptures();
         });
         panel.PointerCaptureLost([&drag](auto const &, auto const &) { drag.active = false; });
-        panel.PointerExited([this](auto const &, auto const &) { hover.IsOpen(false); });
+        panel.PointerExited([this](auto const &, auto const &) { hideVertexHover(); });
         panel.PointerWheelChanged(
             [this, &renderer, panel](auto const &, Input::PointerRoutedEventArgs const &e) {
                 renderer.zoom(static_cast<float>(e.GetCurrentPoint(panel).Properties().MouseWheelDelta()));
-                hover.IsOpen(false);
+                hideVertexHover();
                 dirty = true;
                 e.Handled(true);
             });
@@ -344,6 +377,98 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
             renderer.fit();
             dirty = true;
         });
+    }
+    void hideVertexHover() {
+        hover.Visibility(Visibility::Collapsed);
+    }
+    void showVertexHover(SwapChainPanel const &panel, Point position, size_t index) {
+        if (closed || !ready || !model || index >= model->vertices.size() || !panel.IsLoaded()) {
+            hideVertexHover();
+            return;
+        }
+        auto anchor = panel.TransformToVisual(views).TransformPoint(position);
+        float width = static_cast<float>(views.ActualWidth());
+        float height = static_cast<float>(views.ActualHeight());
+        if (width < 32 || height < 32) {
+            hideVertexHover();
+            return;
+        }
+        hoverText.Text(describeVertex(model->vertices[index], index, *model));
+        hover.MaxWidth(std::min(460.f, width - 16));
+        hover.MaxHeight(height - 16);
+        hover.Visibility(Visibility::Visible);
+        hover.Measure({static_cast<float>(hover.MaxWidth()), static_cast<float>(hover.MaxHeight())});
+        auto size = hover.DesiredSize();
+        float x = anchor.X + 14, y = anchor.Y + 14;
+        if (x + size.Width > width - 8)
+            x = anchor.X - size.Width - 14;
+        if (y + size.Height > height - 8)
+            y = anchor.Y - size.Height - 14;
+        Canvas::SetLeft(hover, std::clamp(x, 8.f, std::max(8.f, width - size.Width - 8)));
+        Canvas::SetTop(hover, std::clamp(y, 8.f, std::max(8.f, height - size.Height - 8)));
+    }
+    void runHoverTest() {
+        if (hoverTestStep == 0) {
+            model = std::make_shared<Model>();
+            model->vertices.resize(3);
+            model->vertices[0].position = {-1, -1, 0};
+            model->vertices[1].position = {1, -1, 0};
+            model->vertices[2].position = {0, 1, 0};
+            model->vertices[0].uv[0] = {0.5f, 0.5f, 0};
+            model->vertices[1].uv[0] = {0.8f, 0.5f, 0};
+            model->vertices[2].uv[0] = {0.5f, 0.8f, 0};
+            for (auto &vertex : model->vertices) {
+                vertex.normal = {0, 0, 1};
+                vertex.uvMask = 1;
+            }
+            model->uvMask = 1;
+            model->indices = {0, 1, 2};
+            model->minimum = {-1, -1, 0};
+            model->maximum = {1, 1, 0};
+            model->radius = 1.5f;
+            render3d.setModel(model.get(), settings);
+            renderUV.setModel(model.get(), settings);
+            empty.Visibility(Visibility::Collapsed);
+        } else {
+            if (hoverTestStep % 10 == 0)
+                mode.SelectedIndex((hoverTestStep / 10) % 3);
+            if (hoverTestStep % 3 == 0) {
+                hideVertexHover();
+                if (hover.Visibility() != Visibility::Collapsed)
+                    throw hresult_error(E_FAIL, L"Hover did not close");
+            } else {
+                auto const &panel = hoverTestStep % 2 ? right : left;
+                auto middle = Point{static_cast<float>(right.ActualWidth() / 2),
+                                    static_cast<float>(right.ActualHeight() / 2)};
+                auto hit = renderUV.pick(middle.X, middle.Y, settings);
+                if (!hit || *hit != 0)
+                    throw hresult_error(E_FAIL, L"Hover picking failed");
+                auto position = Point{static_cast<float>(panel.ActualWidth() - 1),
+                                      static_cast<float>(panel.ActualHeight() - 1)};
+                showVertexHover(panel, position, *hit);
+                if (hover.Visibility() != Visibility::Visible)
+                    throw hresult_error(E_FAIL, L"Hover did not open");
+                if (std::wstring(hoverText.Text()).find(L"TEXCOORD0") == std::wstring::npos)
+                    throw hresult_error(E_FAIL, L"Hover attributes missing");
+                auto size = hover.DesiredSize();
+                if (Canvas::GetLeft(hover) < 0 || Canvas::GetTop(hover) < 0 ||
+                    Canvas::GetLeft(hover) + size.Width > views.ActualWidth() ||
+                    Canvas::GetTop(hover) + size.Height > views.ActualHeight())
+                    throw hresult_error(E_FAIL, L"Hover outside view bounds");
+            }
+        }
+        ++hoverTestStep;
+        dirty = true;
+        if (hoverTestStep > 60) {
+            showVertexHover(left, {10, 10}, model->vertices.size());
+            if (hover.Visibility() != Visibility::Collapsed)
+                throw hresult_error(E_FAIL, L"Invalid vertex left stale hover");
+            showVertexHover(right, {10, 10}, 0);
+            startupLog(L"Hover regression passed: 60 frames, both views, modes, bounds, invalid vertex and "
+                       L"close while visible");
+            exitStatus = 0;
+            window.Close();
+        }
     }
     void refreshSettings() {
         StackPanel content;
@@ -419,7 +544,10 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
                 attribute.Items().Append(box_value(name));
             attribute.SelectedIndex(static_cast<int>(settings.attribute));
             attribute.SelectionChanged([this](auto const &sender, auto const &) {
-                settings.attribute = static_cast<Attribute>(sender.template as<ComboBox>().SelectedIndex());
+                auto selected = sender.template as<ComboBox>().SelectedIndex();
+                if (closed || selected < 0 || selected > 6)
+                    return;
+                settings.attribute = static_cast<Attribute>(selected);
                 refreshColors();
             });
             content.Children().Append(attribute);
@@ -429,7 +557,10 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
                 channel.Items().Append(box_value(to_hstring(i)));
             channel.SelectedIndex(settings.attributeChannel);
             channel.SelectionChanged([this](auto const &sender, auto const &) {
-                settings.attributeChannel = sender.template as<ComboBox>().SelectedIndex();
+                auto selected = sender.template as<ComboBox>().SelectedIndex();
+                if (closed || selected < 0 || selected >= 8)
+                    return;
+                settings.attributeChannel = selected;
                 refreshColors();
             });
             content.Children().Append(channel);
@@ -499,7 +630,7 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
         apartment_context ui;
         loading = true;
         report(L"読み込み中: " + hstring(path.filename().wstring()));
-        hover.IsOpen(false);
+        hideVertexHover();
         std::shared_ptr<Model> next;
         hstring error;
         co_await resume_background();
@@ -587,7 +718,8 @@ struct App : ApplicationT<App, Markup::IXamlMetadataProvider> {
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
     try {
         smokeTest = std::wstring_view(commandLine) == L"--smoke-test";
-        exitStatus = smokeTest ? 1 : 0;
+        hoverTest = std::wstring_view(commandLine) == L"--hover-test";
+        exitStatus = smokeTest || hoverTest ? 1 : 0;
         init_apartment(apartment_type::single_threaded);
         startupLog(L"Application::Start");
         Application::Start([](auto &&) { make<App>(); });
