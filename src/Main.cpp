@@ -363,7 +363,7 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
             hideVertexHover();
             return;
         }
-        hoverText.Text(describeVertex(model->vertices[index], index, *model));
+        hoverText.Text(describeVertex(model->vertices[index], index, *model, settings.influenceSlot));
         hover.MaxWidth(std::min(460.f, width - 16));
         hover.MaxHeight(height - 16);
         hover.Visibility(Visibility::Visible);
@@ -398,6 +398,10 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
             for (auto &vertex : model->vertices)
                 vertex.colorMask = 1;
             model->colorMask = 1;
+            model->bones = {{0, 0, L"Joint0"}, {0, 1, L"Joint1"}, {0, 2, L"Joint2"}};
+            model->maxInfluences = 1;
+            for (uint32_t i = 0; i < 3; ++i)
+                model->vertices[i].influences.push_back({i, 0.1f + 0.4f * i});
             model->indices = {0, 1, 2};
             model->minimum = {-1, -1, 0};
             model->maximum = {1, 1, 0};
@@ -426,6 +430,18 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
                     throw hresult_error(E_FAIL, L"UV surface interior is empty");
                 startupLog(L"UV fill regression passed: interior RGB interpolation, gradient, bounds and "
                            L"surface shading");
+            }
+            if (hoverTestStep == 2) {
+                selectMode(2);
+                for (auto attribute : {Attribute::BlendWeight, Attribute::BlendIndices}) {
+                    settings.attribute = attribute;
+                    refreshSettings();
+                    refreshColors();
+                    auto blended = renderUV.sampleUvColor({0.6f, 0.6f}, settings, render3d.cameraEye());
+                    if (std::abs(blended.r - 0.5f) > 0.07f)
+                        throw hresult_error(E_FAIL, L"Blend attribute interpolation failed");
+                }
+                startupLog(L"Blend attribute GPU regression passed");
             }
             if (hoverTestStep % 10 == 0)
                 selectMode((hoverTestStep / 10) % 3);
@@ -569,24 +585,57 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
                                                     settings.attributeChannel == channel))
                     attribute.SelectedIndex(static_cast<int>(choices.size()) - 1);
             };
-            addAttribute(L"Normal", Attribute::Normal);
-            addAttribute(L"Position", Attribute::Position);
-            addAttribute(L"頂点 Index", Attribute::Index);
-            addAttribute(L"Tangent", Attribute::Tangent);
-            addAttribute(L"Bitangent", Attribute::Bitangent);
+            addAttribute(L"NORMAL", Attribute::Normal);
+            addAttribute(L"POSITION", Attribute::Position);
+            addAttribute(L"SV_VertexID", Attribute::Index);
+            addAttribute(L"TANGENT", Attribute::Tangent);
+            addAttribute(L"BINORMAL", Attribute::Bitangent);
+            addAttribute(L"BLENDWEIGHT", Attribute::BlendWeight);
+            addAttribute(L"BLENDINDICES", Attribute::BlendIndices);
             for (int i = 0; i < 8; ++i)
                 addAttribute(L"TEXCOORD" + to_hstring(i), Attribute::UV, i);
             for (int i = 0; i < 8; ++i)
                 addAttribute(L"COLOR" + to_hstring(i), Attribute::Color, i);
-            attribute.SelectionChanged([this, choices](auto const &sender, auto const &) {
+            ComboBox influence;
+            influence.Header(box_value(L"影響スロット（読み込み順）"));
+            auto slotCount = std::max(size_t{1}, model ? model->maxInfluences : 0);
+            settings.influenceSlot = std::min(settings.influenceSlot, slotCount - 1);
+            for (size_t slot = 0; slot < slotCount; ++slot)
+                influence.Items().Append(box_value(to_hstring(slot)));
+            influence.SelectedIndex(static_cast<int>(settings.influenceSlot));
+            influence.Visibility(settings.attribute == Attribute::BlendWeight ||
+                                         settings.attribute == Attribute::BlendIndices
+                                     ? Visibility::Visible
+                                     : Visibility::Collapsed);
+            influence.SelectionChanged([this](auto const &sender, auto const &) {
                 auto selected = sender.template as<ComboBox>().SelectedIndex();
-                if (closed || selected < 0 || static_cast<size_t>(selected) >= choices.size())
+                if (closed || selected < 0)
                     return;
-                settings.attribute = choices[selected].first;
-                settings.attributeChannel = choices[selected].second;
+                settings.influenceSlot = static_cast<size_t>(selected);
                 refreshColors();
             });
+            auto weightNote = label(L"ウェイトはスロットごとに明るさで表示。ボーン名・全ウェイト・合計値は頂"
+                                    L"点ホバーで確認できます。",
+                                    12);
+            weightNote.TextWrapping(TextWrapping::Wrap);
+            weightNote.Visibility(influence.Visibility());
+            attribute.SelectionChanged(
+                [this, choices, influence, weightNote](auto const &sender, auto const &) {
+                    auto selected = sender.template as<ComboBox>().SelectedIndex();
+                    if (closed || selected < 0 || static_cast<size_t>(selected) >= choices.size())
+                        return;
+                    settings.attribute = choices[selected].first;
+                    settings.attributeChannel = choices[selected].second;
+                    influence.Visibility(settings.attribute == Attribute::BlendWeight ||
+                                                 settings.attribute == Attribute::BlendIndices
+                                             ? Visibility::Visible
+                                             : Visibility::Collapsed);
+                    weightNote.Visibility(influence.Visibility());
+                    refreshColors();
+                });
             content.Children().Append(attribute);
+            content.Children().Append(influence);
+            content.Children().Append(weightNote);
             check(L"無彩色の明るさで表示", settings.grayscale, [this](bool v) {
                 settings.grayscale = v;
                 refreshColors();
@@ -686,6 +735,9 @@ struct ViewerWindow : std::enable_shared_from_this<ViewerWindow> {
             render3d.setModel(next.get(), settings);
             renderUV.setModel(next.get(), settings);
             model = std::move(next);
+            settings.influenceSlot = 0;
+            refreshSettings();
+            refreshColors();
             if (model->uvMask && !(model->uvMask & (1u << settings.uvChannel)))
                 for (int i = 0; i < 8; ++i)
                     if (model->uvMask & (1u << i)) {

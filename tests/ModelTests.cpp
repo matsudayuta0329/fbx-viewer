@@ -28,7 +28,7 @@ template <class F> void rejects(F f) {
     require(failed, "Invalid input was accepted");
 }
 void fixture(std::filesystem::path const &path, bool attributes, char const *format = "fbxa",
-             bool mirror = false) {
+             bool mirror = false, bool skin = false) {
     aiScene scene;
     scene.mRootNode = new aiNode("Root");
     scene.mNumMaterials = 1;
@@ -62,6 +62,24 @@ void fixture(std::filesystem::path const &path, bool attributes, char const *for
         node->mTransformation.a1 = -2;
     node->mNumMeshes = 1;
     node->mMeshes = new unsigned[1]{0};
+    if (skin) {
+        mesh->mNumBones = node->mNumChildren = 6;
+        mesh->mBones = new aiBone *[6];
+        node->mChildren = new aiNode *[6];
+        float weights[]{0.05f, 0.1f, 0.15f, 0.2f, 0.25f, 0.25f};
+        for (unsigned i = 0; i < 6; ++i) {
+            auto name = "Joint" + std::to_string(i);
+            node->mChildren[i] = new aiNode(name);
+            node->mChildren[i]->mParent = node;
+            auto bone = mesh->mBones[i] = new aiBone;
+            bone->mName = aiString(name);
+            bone->mNumWeights = i == 0 ? 2 : 1;
+            bone->mWeights = new aiVertexWeight[bone->mNumWeights];
+            bone->mWeights[0] = aiVertexWeight(0, weights[i]);
+            if (i == 0)
+                bone->mWeights[1] = aiVertexWeight(1, 0.4f);
+        }
+    }
     Assimp::Exporter exporter;
     auto blob = exporter.ExportToBlob(&scene, format);
     require(blob != nullptr, exporter.GetErrorString());
@@ -93,6 +111,33 @@ int main() {
         require(describeVertex(model.vertices[0], 0, model).find(L"TEXCOORD1") != std::wstring::npos,
                 "Hover data missing UV1");
         Settings settings;
+        for (auto format : {"fbxa", "fbx"}) {
+            auto skinPath = directory / (std::string("skin-") + format + ".fbx");
+            fixture(skinPath, true, format, false, true);
+            auto skin = loadModel(skinPath);
+            require(skin.maxInfluences == 6 && skin.bones.size() == 6, "Bone influences truncated");
+            auto const &weighted = skin.vertices[0];
+            require(weighted.influences.size() == 6, "Six weights not retained");
+            require(approximately(weighted.influences[0].weight, 0.05f), "Weight changed");
+            require(approximately(skin.vertices[1].influences[0].weight, 0.4f), "Weights were normalized");
+            require(skin.vertices[2].influences.empty(), "Invented unweighted vertex data");
+            Settings blend;
+            blend.attribute = Attribute::BlendWeight;
+            blend.influenceSlot = 5;
+            auto mapped = vertexColor(weighted, 0, skin, blend);
+            require(approximately(mapped.r, 0.25f), "Late influence not visualized");
+            blend.attribute = Attribute::BlendIndices;
+            mapped = vertexColor(weighted, 0, skin, blend);
+            require(approximately(mapped.r, 1), "Bone index mapping incorrect");
+            blend.influenceSlot = 6;
+            mapped = vertexColor(weighted, 0, skin, blend);
+            require(mapped.r == 1 && mapped.g == 0 && mapped.b == 1, "Missing influence not marked");
+            auto description = describeVertex(weighted, 0, skin);
+            require(description.find(L"Joint5") != std::wstring::npos &&
+                        description.find(L"BLENDWEIGHT") != std::wstring::npos &&
+                        description.find(L"Weight sum: 1.00000") != std::wstring::npos,
+                    "Skin hover information missing");
+        }
         settings.attribute = Attribute::Normal;
         auto color = vertexColor(model.vertices[0], 0, model, settings);
         require(approximately(color.r, 0.5f) && approximately(color.b, 1), "Normal color mapping incorrect");

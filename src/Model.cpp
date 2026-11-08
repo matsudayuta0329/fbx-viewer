@@ -11,6 +11,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <Windows.h>
 
 namespace viewer {
 Vec3 operator+(Vec3 a, Vec3 b) {
@@ -34,6 +35,15 @@ Vec3 normalized(Vec3 a) {
 }
 static Vec3 convert(aiVector3D a) {
     return {a.x, a.y, a.z};
+}
+static std::wstring boneName(char const *name) {
+    int length = MultiByteToWideChar(CP_UTF8, 0, name, -1, nullptr, 0);
+    if (!length)
+        return L"?";
+    std::wstring value(static_cast<size_t>(length), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, name, -1, value.data(), length);
+    value.pop_back();
+    return value;
 }
 Model loadModel(std::filesystem::path const &path) {
     auto ext = path.extension().wstring();
@@ -105,6 +115,22 @@ Model loadModel(std::filesystem::path const &path) {
                 result.colorMask |= v.colorMask;
                 result.vertices.push_back(v);
             }
+            // Preserve every imported influence, including zero weights. Do not
+            // normalize, sort by strength, or limit the number of influences.
+            for (unsigned b = 0; b < mesh->mNumBones; ++b) {
+                auto bone = mesh->mBones[b];
+                auto id = static_cast<uint32_t>(result.bones.size());
+                result.bones.push_back({meshIndex, b, boneName(bone->mName.C_Str())});
+                for (unsigned w = 0; w < bone->mNumWeights; ++w) {
+                    auto weight = bone->mWeights[w];
+                    if (weight.mVertexId >= mesh->mNumVertices || !std::isfinite(weight.mWeight) ||
+                        weight.mWeight < 0)
+                        throw std::runtime_error("Invalid bone weight in mesh.");
+                    auto &vertex = result.vertices[base + weight.mVertexId];
+                    vertex.influences.push_back({id, weight.mWeight});
+                    result.maxInfluences = std::max(result.maxInfluences, vertex.influences.size());
+                }
+            }
             for (unsigned f = 0; f < mesh->mNumFaces; ++f) {
                 auto const &face = mesh->mFaces[f];
                 if (face.mNumIndices != 3)
@@ -148,6 +174,19 @@ Model loadModel(std::filesystem::path const &path) {
 Color vertexColor(Vertex const &v, size_t index, Model const &model, Settings const &s) {
     Vec3 value{};
     switch (s.attribute) {
+    case Attribute::BlendWeight:
+    case Attribute::BlendIndices: {
+        if (s.influenceSlot >= v.influences.size())
+            return {1, 0, 1, 1};
+        auto const &influence = v.influences[s.influenceSlot];
+        float t = s.attribute == Attribute::BlendWeight
+                      ? influence.weight
+                      : static_cast<float>(influence.bone) /
+                            static_cast<float>(std::max(size_t{1}, model.bones.size()) -
+                                               (model.bones.size() > 1 ? 1 : 0));
+        value = {t, t, t};
+        break;
+    }
     case Attribute::Normal:
         value = v.normal * 0.5f + Vec3{0.5f, 0.5f, 0.5f};
         break;
@@ -191,8 +230,17 @@ Color vertexColor(Vertex const &v, size_t index, Model const &model, Settings co
     }
     return {value.x, value.y, value.z, 1};
 }
-std::wstring describeVertex(Vertex const &v, size_t index, Model const &model) {
+std::wstring describeVertex(Vertex const &v, size_t index, Model const &model, size_t influenceSlot) {
     std::wostringstream out;
+    if (influenceSlot < v.influences.size()) {
+        auto const &influence = v.influences[influenceSlot];
+        out << L"Slot " << influenceSlot << L" / BLENDWEIGHT: "
+            << std::setprecision(std::numeric_limits<float>::max_digits10) << influence.weight
+            << L" / BLENDINDICES: " << influence.bone;
+        if (influence.bone < model.bones.size())
+            out << L"\n" << model.bones[influence.bone].name;
+        out << L'\n';
+    }
     out << std::fixed << std::setprecision(5);
     out << L"Vertex " << index << L" / mesh " << v.mesh << L" / local " << v.localIndex;
     auto vec = [&](wchar_t const *name, Vec3 a) {
@@ -219,7 +267,23 @@ std::wstring describeVertex(Vertex const &v, size_t index, Model const &model) {
         }
     if (!v.colorMask)
         out << L"\nCOLOR: N/A";
-    (void)model;
+    if (v.influences.empty())
+        out << L"\nBLENDWEIGHT / BLENDINDICES: N/A";
+    else {
+        double total = 0;
+        for (size_t slot = 0; slot < v.influences.size(); ++slot) {
+            auto const &influence = v.influences[slot];
+            total += influence.weight;
+            out << L"\n[" << slot << L"] BLENDWEIGHT: " << influence.weight << L" / BLENDINDICES: "
+                << influence.bone;
+            if (influence.bone < model.bones.size()) {
+                auto const &bone = model.bones[influence.bone];
+                out << L" / " << bone.name << L" (mesh " << bone.mesh << L", bone " << bone.localIndex
+                    << L")";
+            }
+        }
+        out << L"\nWeight sum: " << total;
+    }
     return out.str();
 }
 } // namespace viewer
