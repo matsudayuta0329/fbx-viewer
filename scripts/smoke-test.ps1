@@ -1,7 +1,8 @@
-param([ValidateSet('Debug','Release')][string]$Configuration = 'Release', [switch]$Hover)
+param([ValidateSet('Debug','Release')][string]$Configuration = 'Release', [switch]$Hover, [string]$OutputDirectory)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $executable = Join-Path $root "build\x64\$Configuration\FbxViewer.exe"
+if ($OutputDirectory) { $executable = Join-Path ([IO.Path]::GetFullPath($OutputDirectory)) 'FbxViewer.exe' }
 if (!(Test-Path -LiteralPath $executable)) { throw "Build the $Configuration application first." }
 $argument = if ($Hover) { '--hover-test' } else { '--smoke-test' }
 $process = Start-Process -FilePath $executable -ArgumentList $argument -WindowStyle Hidden -PassThru
